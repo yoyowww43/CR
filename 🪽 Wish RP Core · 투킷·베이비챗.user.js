@@ -3,7 +3,7 @@
 // @namespace    local.rp.context.manager.hap.gpt.tookit.babechat.new
 // @updateURL    none
 // @downloadURL  none
-// @version      0.2.10.2
+// @version      0.2.10.3
 // @description  HAP-gpt 0.2.10 기반 · 투킷/베이비챗 호환 시험판 · 방별 기억 관리와 전송 전 주입
 // @author       User
 // @license      All Rights Reserved
@@ -523,7 +523,6 @@ function createWishSiteAdapter(env) {
   // extract request 112~130 s at 250~267 output tokens/s, the time set by the output tokens (max_tokens, reasoning included).
   // 600 s holds the setting's 65536-token ceiling at half that speed. Only this request uses it (callAiProvider).
   const AI_DEEPSEEK_THINKING_TIMEOUT_MS = 600000;
-  const HAP_GPT_CLIENT_VERSION = '0.2.10';
   // HAP-gpt local bridge client. OAuth tokens never enter this userscript.
   class WishChatGptSubscriptionClient {
     constructor({ connection, storageKey = 'wish-chatgpt-subscription-pending-v1', getValue = GM_getValue, setValue = GM_setValue, request = GM_xmlhttpRequest, lock = globalThis.navigator?.locks, statusRetryDelays = [250,750,1500,3000] } = {}) {
@@ -552,7 +551,14 @@ function createWishSiteAdapter(env) {
           let data;
           try { data = JSON.parse(response.responseText); }
           catch { return reject(Object.assign(new Error('로컬 브리지 응답을 읽지 못했습니다.'), { code:'CHATGPT_BRIDGE_FORMAT' })); }
-          if (response.status < 200 || response.status >= 300) return reject(Object.assign(new Error(data.message || data.code || `로컬 브리지 오류 ${response.status}`), { code:data.code || 'CHATGPT_BRIDGE_HTTP', status:response.status }));
+          if (response.status < 200 || response.status >= 300) {
+            const rejectedFields=route==='/api/jobs'&&response.status===400&&data.code==='PAYLOAD_FIELDS';
+            return reject(Object.assign(new Error(data.message||data.code||`로컬 브리지 오류 ${response.status}`),{
+              code:data.code||'CHATGPT_BRIDGE_HTTP',status:response.status,
+              diagnostic:{service:'ChatGPT 로컬 브리지',method:body===undefined?'GET':'POST',path:route,httpStatus:response.status,responseChars:String(response.responseText||'').length,...(rejectedFields?{outcome:'not-applied'}:{})},
+              ...(rejectedFields?{accepted:false,noAutoRetry:true}:{}),
+            }));
+          }
           resolve(data);
         },
         onerror: () => reject(Object.assign(new Error('로컬 브리지에 연결하지 못했습니다. 같은 요청을 자동으로 다시 보내지 않습니다.'), { code:'CHATGPT_BRIDGE_NETWORK', uncertain:true })),
@@ -618,7 +624,17 @@ function createWishSiteAdapter(env) {
         }
         const request_id = crypto.randomUUID();
         await this.setValue(this.key, { request_id, fingerprint, context, created_at:Date.now() });
-        return this.api('/api/jobs', { ...payload, request_id });
+        try { return await this.api('/api/jobs', { ...payload, request_id }); }
+        catch(error) {
+          // The reference bridge validates fields before creating a job. A definitive HTTP 400 is not an uncertain POST.
+          if(error.code==='PAYLOAD_FIELDS'&&error.status===400&&error.accepted===false){
+            const pending=await this.pending();
+            if(pending?.request_id===request_id&&pending.fingerprint===fingerprint){
+              try{await this.setValue(this.key,null);}catch{ /* Keep the original rejection; an uncleared marker is still safe. */ }
+            }
+          }
+          throw error;
+        }
       });
     }
 
@@ -2412,6 +2428,7 @@ const WLOG=(()=>{
     HELD_PARTIAL:{outcome:'일부 작업이 이미 반영됐을 수 있습니다. 현재 목록과 완료 항목부터 확인하세요.',toast:'보류 제안 정리가 덜 끝남 · 같은 버튼을 한 번 더 눌러 주세요',match:(row)=>/^(?:장부 처리는 저장됐지만 대기열 정리가 남았습니다\. .*)$/.test(row.message)},
     LOG_DATE_SPLIT:{category:'자료 형식·연결',cause:'바꾼 날짜 때문에 날짜로그가 다른 개수의 블록으로 읽혀 저장을 멈췄습니다.',next:'날짜를 2026년 9월 18일 형식으로 넣고, 한 번에 조금씩 적용하세요.',outcome:'not-applied',match:(row)=>/^(?:날짜 수정 후 블록 수가 달라져 저장을 중단했습니다\. 날짜 형식을 확인해 주세요\.|날짜 수정 후 블록 수가 달라져 적용을 중단했습니다\.|날짜 형식을 확인해 주세요\. 예: 2026년 9월 18일)$/.test(row.message)},
     LOG_DUP_EDIT:{category:'자료 형식·연결',cause:'날짜·사건 제목이 똑같은 블록은 하나로 취급되어 둘을 함께 저장할 수 없습니다.',next:'다른 사건이면 한쪽의 날짜나 사건 제목을 다르게 쓰고, 같은 사건이면 이미 있는 블록에 내용을 보태 주세요.',outcome:'not-applied',toast:'같은 날짜·제목 블록이 생겨 저장하지 않음',job:(r)=>r.operation==='편집 내용 검증·저장 중'?'기억 카드 저장':'',match:(row)=>/^(?:날짜·사건 제목이 같은 날짜로그 블록이 하나 더 생겨 저장하지 않았습니다: .*)$/.test(row.message)},
+    CHATGPT_PAYLOAD_FIELDS:{category:'브리지 요청 형식 불일치',cause:'로컬 브리지가 허용하지 않는 필드를 포함한 요청을 거절했습니다. 로그인 실패나 사이트 대화 오류가 아닙니다.',next:'확장 스크립트를 최신 호환판으로 업데이트하세요. 이전 실패 요청이 남아 있으면 보조 AI 연결에서 [대기 요청 폐기] 후 연결 테스트를 다시 실행하세요.',outcome:'not-applied',toast:'브리지 요청 형식 불일치 · 호환판 업데이트 필요',match:row=>row.provider==='chatgpt-subscription'&&row.code==='PAYLOAD_FIELDS'&&row.httpStatus===400},
     CHATGPT_PENDING_COMPLETED:{category:'이전 요청 정리 필요',cause:'이전 ChatGPT 구독 요청의 완료 결과가 아직 적용 또는 폐기되지 않아, 중복 호출을 막기 위해 새 요청을 보내지 않았습니다.',next:'설정 → 보조 AI 연결 → 연결·모델에서 [대기 요청 확인] 후 [대기 요청 폐기]를 누르고 [함께 정리]를 다시 실행하세요. 폐기는 기존 기억·인물 자료를 바꾸지 않으며 브리지 서버 재시작은 필요 없습니다.',outcome:'not-applied',toast:'이전 구독 결과 정리 필요 · 설정 → 보조 AI 연결',match:(row)=>row.code==='CHATGPT_PENDING_COMPLETED'},
     PROGRAM_BUG:{category:'프로그램 오류',cause:'Wish 코드의 오류입니다. 설정이나 기억 자료의 문제는 아닙니다.',next:'창을 닫았다 다시 열거나 페이지를 새로고침한 뒤 다시 해 보세요. 반복되면 [기록 복사]로 이 기록을 전달해 주세요.',toast:'내부 오류로 멈춤 · 다시 시도해 주세요',match:(row)=>/^(?:TypeError|ReferenceError|RangeError|InternalError|EvalError)$/.test(row.code)&&!/fetch|Load failed|NetworkError|network|cancel|abort|네트워크|연결/i.test(row.message)},
     // G49:b8 end
@@ -3699,8 +3716,8 @@ const WLOG=(()=>{
       const bytes=new TextEncoder().encode(String(systemPrompt||'')+'\u0000'+String(userPrompt||'')),hash=await crypto.subtle.digest('SHA-256',bytes),sourceHash=Array.from(new Uint8Array(hash),x=>x.toString(16).padStart(2,'0')).join('');
       const context={provider:'chatgpt-subscription',model:cfg.chatGptSubscriptionModel,roomId:String(state.currentRoom?.chatId||''),messageId:String(options.sourceMessageId||options.jobCode||''),sourceHash,taskKind:String(options.taskKind||''),operation:String(options.subscriptionResumeOperation||options.operationLabel||'')};
       const efforts=chatGptSubscriptionEfforts(cfg,cfg.chatGptSubscriptionModel),effort=normalizeChatGptSubscriptionEffort(cfg.chatGptSubscriptionEffort,cfg,cfg.chatGptSubscriptionModel);
-      const clientText=(value,limit)=>String(value||'').replace(/\s+/g,' ').trim().slice(0,limit);
-      const payload={model:cfg.chatGptSubscriptionModel,...(!efforts.length||efforts.includes(effort)?{effort}:{}),instructions:String(systemPrompt||''),input:String(userPrompt||''),client:{id:'wish-hap-gpt',name:'Wish HAP-gpt',version:HAP_GPT_CLIENT_VERSION,room_id:clientText(context.roomId,200),room_name:clientText(WishRoomNames.display(state.currentRoom),160),task_kind:clientText(context.taskKind,40),task_name:clientText(context.operation||context.taskKind||'AI 요청',200)}};
+      // Reference bridges accept only these request fields; room/task metadata stays in the local context.
+      const payload={model:cfg.chatGptSubscriptionModel,...(!efforts.length||efforts.includes(effort)?{effort}:{}),instructions:String(systemPrompt||''),input:String(userPrompt||'')};
       const job=await WishUsage.track(cfg,options,async()=>({...await client.run(context,payload,{maxWaitMs:Number(options.subscriptionPrimaryWaitMs||options.timeoutMs)||900000,finalChecks:2,finalCheckDelayMs:30000}),object:'response'}),{provider:'chatgpt-subscription',model:cfg.chatGptSubscriptionModel});
       if(job?.status !== 'completed')throw Object.assign(new Error('ChatGPT 구독 응답이 완료되지 않아 기존 자료를 유지했습니다.'),{code:'AI_INCOMPLETE'});
       const live=loadAiSettings();
